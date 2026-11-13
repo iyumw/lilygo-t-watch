@@ -1,506 +1,449 @@
 /*
-  Safe Evidence — Relógio (LilyGo T-Watch-2020 V3)
-  ------------------------------------------------------------------------------
-  Requisito atendido: RE01 — Botão de acionamento e interrupção.
+ * Safe Evidence - Relógio (LilyGo T-Watch-2020 V3) - RE01
+ *
+ * Mostrador comum de smartwatch (hora, data, bateria); nada na tela indica o
+ * Safe Evidence. O relógio procura a câmera por BLE ao ligar e reconecta
+ * sozinho; conectado, mostra só um ícone de Bluetooth discreto.
+ *
+ * Botão lateral (lido pelo chip de energia AXP202):
+ *   - segurar ~1,5 s: inicia/encerra a gravação, sem luz, vibração ou som;
+ *   - toque curto: liga/desliga a tela; dois toques curtos: desliga o relógio.
+ * Tocar na tela só acende a tela, nunca grava.
+ *
+ * Sem conexão, o pedido fica guardado e é enviado ao conectar. A cada
+ * conexão o relógio reenvia o estado desejado, então a câmera volta a
+ * gravar sozinha se reiniciar no meio de uma gravação.
+ *
+ * NimBLE-Arduino 2.x: o relógio precisa dos papéis CENTRAL e OBSERVER
+ * habilitados no nimconfig.h da biblioteca; a câmera precisa deles
+ * desabilitados. Ajuste o arquivo antes de compilar cada um.
+ */
 
-  O que o relógio faz:
-    - Mostra um mostrador comum de smartwatch: hora, data e bateria. Nada
-      na tela indica o Safe Evidence.
-    - Ao ligar, já procura a câmera e conecta via BLE em segundo plano. Se
-      a conexão cair, reconecta sozinho. Assim o primeiro "apertar e
-      segurar" já grava, sem esperar a busca.
-    - Quando está conectado à câmera, aparece um ícone de Bluetooth pequeno
-      e cinza no canto da tela, igual ao de qualquer smartwatch pareado com
-      um celular. É a única sinalização, e ela é discreta de propósito.
-
-  Botão lateral:
-    - Apertar e SEGURAR (~1,5 s, "toque longo" do AXP202): inicia a gravação;
-      repetir encerra (toggle). Nenhuma luz, vibração, som ou mudança na
-      tela ao gravar (discrição exigida pelo RE01).
-    - Toque CURTO: liga/desliga a tela (como um relógio normal). A tela
-      também apaga sozinha após TELA_TEMPO_LIGADA_MS.
-
-  Tela sensível ao toque:
-    - Tocar na tela apagada acende a tela (igual a um smartwatch comum).
-    - Tocar com a tela acesa mantém ela acesa por mais TELA_TEMPO_LIGADA_MS.
-    - O toque na tela NUNCA inicia/encerra gravação (só o botão faz isso),
-      pra não gravar sem querer com o relógio encostando em algo.
-    - Dois toques curtos seguidos (< DUPLO_TOQUE_JANELA_MS): desliga o relógio.
-
-  Se o botão for apertado sem conexão com a câmera, o comando fica
-  guardado e é enviado assim que conectar. E sempre que (re)conecta, o
-  relógio reenvia o estado atual (gravando ou não), então se a câmera
-  reiniciar no meio de uma gravação, ela volta a gravar sozinha.
-
-  Hardware:
-    No T-Watch-2020 o botão lateral NÃO é um GPIO comum: ele está ligado ao
-    chip de energia AXP202, que distingue toque curto e longo e avisa o
-    ESP32 pelo pino AXP202_INT.
-
-  Biblioteca BLE: NimBLE-Arduino 2.x, com os papéis CENTRAL e OBSERVER
-  habilitados no nimconfig.h (o relógio é quem procura e conecta na câmera).
-  Ver a nota no final do arquivo.
-
-  Horário (Brasília):
-    Sempre que um firmware NOVO é gravado, o relógio acerta o RTC com o
-    horário do computador no momento da compilação (+ AJUSTE_GRAVACAO_S,
-    o tempo que leva pra compilar e enviar). O computador precisa estar no
-    fuso de Brasília (UTC-3, sem horário de verão desde 2019).
-    Depois disso o RTC continua contando sozinho, mesmo com o relógio
-    desligado pelo botão. Se a hora ficar alguns segundos atrasada, aumente
-    AJUSTE_GRAVACAO_S; se ficar adiantada, diminua.
-*/
-
-// Define o modelo do relógio ANTES de incluir a biblioteca — obrigatório.
-#define LILYGO_WATCH_2020_V3
+#define LILYGO_WATCH_2020_V3  // precisa vir antes do include da biblioteca
 #include <LilyGoWatch.h>
-
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 
-// UUIDs do serviço/característica BLE — IDÊNTICOS aos do firmware da ESP32-CAM.
-#define BLE_SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define BLE_CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-1234567890ab"
+// Iguais aos do firmware da câmera
+#define UUID_SERVICO "12345678-1234-1234-1234-1234567890ab"
+#define UUID_CARACTERISTICA "abcd1234-ab12-cd34-ef56-1234567890ab"
 
-#define CMD_PARAR   0x00
-#define CMD_INICIAR 0x01
+#define COMANDO_PARAR 0x00
+#define COMANDO_INICIAR 0x01
 
-// --- Ajustes ---------------------------------------------------------------
-static const unsigned long DUPLO_TOQUE_JANELA_MS = 600;
-static const unsigned long TELA_TEMPO_LIGADA_MS = 8000;
-// Espera entre tentativas de achar a câmera: começa curta e vai
-// aumentando até o máximo, pra não gastar bateria procurando sem parar.
-static const uint32_t BUSCA_ESPERA_MIN_MS = 2000;
-static const uint32_t BUSCA_ESPERA_MAX_MS = 20000;
-static const uint32_t BUSCA_DURACAO_MS = 3000;
-// Segundos entre a compilação e o relógio começar a rodar (compilar +
-// enviar). Com Upload Speed 921600 fica perto de 20 s; com 115200, ~80 s.
-static const int AJUSTE_GRAVACAO_S = 20;
-// Intervalo entre leituras da tela de toque.
-static const unsigned long TOQUE_INTERVALO_MS = 50;
+static const unsigned long JANELA_DUPLO_TOQUE_MS = 600;
+static const unsigned long TEMPO_TELA_LIGADA_MS = 8000;
+static const unsigned long INTERVALO_LEITURA_TOQUE_MS = 50;
+static const unsigned long INTERVALO_REDESENHO_MS = 500;
+static const unsigned long ESPERA_ENVIO_ANTES_DE_DESLIGAR_MS = 1500;
+static const unsigned long PAUSA_DO_LACO_MS = 20;
 
-// Cores (RGB565)
-#define COR_FUNDO      TFT_BLACK
-#define COR_HORA       TFT_WHITE
-#define COR_SECUNDARIA 0x8C51   // cinza claro
-#define COR_ICONE      0x6B4D   // cinza discreto
+// A espera entre buscas pela câmera dobra até o máximo, para poupar bateria.
+static const uint32_t ESPERA_MINIMA_BUSCA_MS = 2000;
+static const uint32_t ESPERA_MAXIMA_BUSCA_MS = 20000;
+static const uint32_t DURACAO_BUSCA_MS = 3000;
+static const uint32_t TIMEOUT_CONEXAO_MS = 5000;
+static const uint32_t ESPERA_POR_COMANDO_MS = 1000;
+static const uint32_t PILHA_TAREFA_BLE = 8192;
+static const int NUCLEO_TAREFA_BLE = 0;
 
-TTGOClass *ttgo;
-TFT_eSPI *tft;
+// Segundos entre compilar e o relógio começar a rodar (~20 s a 921600 baud,
+// ~80 s a 115200). Hora atrasada: aumente; adiantada: diminua.
+static const int AJUSTE_TEMPO_DE_GRAVACAO_S = 20;
 
-// --- Estado ------------------------------------------------------------------
+#define COR_FUNDO TFT_BLACK
+#define COR_HORA TFT_WHITE
+#define COR_SECUNDARIA 0x8C51
+#define COR_ICONE 0x6B4D
 
-// Setado pela interrupção do AXP202 (botão). volatile: alterado numa ISR.
-volatile bool pmuInterrompeu = false;
+#define CENTRO_X 120
+#define POSICAO_HORA_Y 105
+#define POSICAO_DATA_Y 160
+#define FONTE_HORA 7
+#define FONTE_DATA 4
+#define FONTE_BATERIA 2
 
-// Gravação: o que a USUÁRIA pediu por último (o relógio garante que a
-// câmera fique nesse estado sempre que estiver conectada).
+TTGOClass *relogio;
+TFT_eSPI *tela;
+
+volatile bool chipDeEnergiaInterrompeu = false;
+// O último pedido da usuária; a câmera é mantida nesse estado sempre que conectada.
 volatile bool gravacaoDesejada = false;
+volatile bool conectadoNaCamera = false;
+// Fila de uma posição: vale sempre o último comando do botão.
+QueueHandle_t filaDeComandos;
 
-// Conexão com a câmera (atualizada pela tarefa de BLE, lida pela tela).
-volatile bool bleConectado = false;
-
-// Fila de 1 posição: último comando pedido pelo botão, pra tarefa de BLE enviar.
-QueueHandle_t filaComando;
-
-static unsigned long momentoUltimoToqueCurto = 0;
+static unsigned long ultimoToqueCurtoMs = 0;
 static bool telaLigada = true;
-static unsigned long telaLigadaDesde = 0;
+static unsigned long telaLigadaDesdeMs = 0;
 
-// ISR: só marca a flag; o tratamento é no loop().
-void IRAM_ATTR aoInterromperPMU() {
-  pmuInterrompeu = true;
+void IRAM_ATTR aoInterromperChipDeEnergia() {
+  chipDeEnergiaInterrompeu = true;
 }
 
-// ==================== BLE (roda numa tarefa própria) ====================
-//
-// Tudo que é BLE fica nesta tarefa, no núcleo 0. O loop() (tela e botão)
-// roda no núcleo 1 e nunca espera pela busca/conexão — por isso o botão e
-// o relógio continuam respondendo enquanto a câmera é procurada.
+// ==================== BLE (tarefa própria, núcleo 0) ====================
+// O loop() (tela e botão) roda no núcleo 1 e nunca espera pela busca da câmera.
 
-static NimBLEClient *bleClient = nullptr;
-static NimBLERemoteCharacteristic *bleCaracteristica = nullptr;
+static NimBLEClient *clienteBle = nullptr;
+static NimBLERemoteCharacteristic *caracteristicaDaCamera = nullptr;
 
-class CallbacksCliente : public NimBLEClientCallbacks {
+class CallbacksDoCliente : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient *cliente, int motivo) override {
-    bleConectado = false;
-    bleCaracteristica = nullptr;
+    conectadoNaCamera = false;
+    caracteristicaDaCamera = nullptr;
     Serial.printf("[BLE] Desconectado da camera (motivo %d). Vou reconectar.\n", motivo);
   }
 };
 
-// Procura a câmera pelo UUID do serviço e conecta. true se ficou pronta.
-bool bleProcurarEConectar() {
-  NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
-  NimBLEScanResults resultados = scan->getResults(BUSCA_DURACAO_MS, false);
-
-  const NimBLEAdvertisedDevice *camera = nullptr;
-  for (int i = 0; i < resultados.getCount(); i++) {
-    const NimBLEAdvertisedDevice *d = resultados.getDevice(i);
-    if (d->isAdvertisingService(NimBLEUUID(BLE_SERVICE_UUID))) {
-      camera = d;
-      break;
-    }
+const NimBLEAdvertisedDevice *procurarCamera(NimBLEScan *busca) {
+  NimBLEScanResults encontrados = busca->getResults(DURACAO_BUSCA_MS, false);
+  for (int i = 0; i < encontrados.getCount(); i++) {
+    const NimBLEAdvertisedDevice *dispositivo = encontrados.getDevice(i);
+    if (dispositivo->isAdvertisingService(NimBLEUUID(UUID_SERVICO))) return dispositivo;
   }
+  return nullptr;
+}
+
+bool conectarNaCamera() {
+  NimBLEScan *busca = NimBLEDevice::getScan();
+  busca->setActiveScan(true);
+  const NimBLEAdvertisedDevice *camera = procurarCamera(busca);
   if (camera == nullptr) {
-    scan->clearResults();
+    busca->clearResults();
     return false;
   }
 
-  if (bleClient == nullptr) {
-    bleClient = NimBLEDevice::createClient();
-    bleClient->setClientCallbacks(new CallbacksCliente(), true);
-    bleClient->setConnectTimeout(5000);
+  if (clienteBle == nullptr) {
+    clienteBle = NimBLEDevice::createClient();
+    clienteBle->setClientCallbacks(new CallbacksDoCliente(), true);
+    clienteBle->setConnectTimeout(TIMEOUT_CONEXAO_MS);
   }
 
-  bool ok = bleClient->connect(camera);
-  scan->clearResults();  // "camera" aponta pros resultados: só limpa depois de conectar
-  if (!ok) return false;
+  bool conectou = clienteBle->connect(camera);
+  busca->clearResults();  // "camera" aponta para os resultados: só limpa depois de conectar
+  if (!conectou) return false;
 
-  NimBLERemoteService *servico = bleClient->getService(BLE_SERVICE_UUID);
-  NimBLERemoteCharacteristic *carac = servico ? servico->getCharacteristic(BLE_CHARACTERISTIC_UUID) : nullptr;
-  if (carac == nullptr) {
-    bleClient->disconnect();
+  NimBLERemoteService *servico = clienteBle->getService(UUID_SERVICO);
+  NimBLERemoteCharacteristic *caracteristica = servico ? servico->getCharacteristic(UUID_CARACTERISTICA) : nullptr;
+  if (caracteristica == nullptr) {
+    clienteBle->disconnect();
     return false;
   }
 
-  bleCaracteristica = carac;
+  caracteristicaDaCamera = caracteristica;
   return true;
 }
 
-bool bleEnviar(uint8_t comando) {
-  if (!bleConectado || bleCaracteristica == nullptr) return false;
-  bool ok = bleCaracteristica->writeValue(&comando, 1, true);
-  Serial.printf("[BLE] Comando %s %s.\n",
-                comando == CMD_INICIAR ? "INICIAR" : "PARAR",
-                ok ? "enviado" : "FALHOU");
-  return ok;
+bool enviarComando(uint8_t comando) {
+  if (!conectadoNaCamera || caracteristicaDaCamera == nullptr) return false;
+  bool enviado = caracteristicaDaCamera->writeValue(&comando, 1, true);
+  Serial.printf("[BLE] Comando %s %s.\n", comando == COMANDO_INICIAR ? "INICIAR" : "PARAR",
+                enviado ? "enviado" : "FALHOU");
+  return enviado;
 }
 
-void tarefaBLE(void *param) {
-  uint32_t espera = BUSCA_ESPERA_MIN_MS;
+// A câmera ignora INICIAR se já grava e PARAR se já parou, então reenviar é seguro.
+void sincronizarEstadoComCamera() {
+  enviarComando(gravacaoDesejada ? COMANDO_INICIAR : COMANDO_PARAR);
+  xQueueReset(filaDeComandos);
+}
+
+// Espera antes da próxima busca, mas acorda na hora se o botão for apertado.
+uint32_t aguardarProximaBusca(uint32_t esperaMs) {
+  uint8_t comando;
+  if (xQueuePeek(filaDeComandos, &comando, pdMS_TO_TICKS(esperaMs)) == pdTRUE) return ESPERA_MINIMA_BUSCA_MS;
+  return min(esperaMs * 2, ESPERA_MAXIMA_BUSCA_MS);
+}
+
+bool cameraConectada() {
+  return conectadoNaCamera && clienteBle != nullptr && clienteBle->isConnected();
+}
+
+void tarefaBle(void *parametro) {
+  uint32_t esperaMs = ESPERA_MINIMA_BUSCA_MS;
 
   for (;;) {
-    // --- 1. Sem conexão: procura a câmera ---
-    if (!bleConectado || bleClient == nullptr || !bleClient->isConnected()) {
-      bleConectado = false;
+    if (!cameraConectada()) {
+      conectadoNaCamera = false;
       Serial.println("[BLE] Procurando a camera...");
-      if (bleProcurarEConectar()) {
-        bleConectado = true;
-        espera = BUSCA_ESPERA_MIN_MS;
+      if (conectarNaCamera()) {
+        conectadoNaCamera = true;
+        esperaMs = ESPERA_MINIMA_BUSCA_MS;
         Serial.println("[BLE] Conectado a camera.");
-        // Sincroniza: garante que a câmera está no estado que a usuária
-        // pediu (a câmera ignora INICIAR se já grava e PARAR se já parou).
-        bleEnviar(gravacaoDesejada ? CMD_INICIAR : CMD_PARAR);
-        xQueueReset(filaComando);  // o estado atual já foi enviado
+        sincronizarEstadoComCamera();
       } else {
-        Serial.printf("[BLE] Camera nao encontrada. Nova tentativa em %lu s.\n",
-                      (unsigned long)(espera / 1000));
-        // Espera, mas acorda na hora se o botão for apertado
-        uint8_t cmd;
-        if (xQueuePeek(filaComando, &cmd, pdMS_TO_TICKS(espera)) == pdTRUE) {
-          espera = BUSCA_ESPERA_MIN_MS;  // usuária quer gravar: procura já
-        } else {
-          espera = min(espera * 2, BUSCA_ESPERA_MAX_MS);
-        }
+        Serial.printf("[BLE] Camera nao encontrada. Nova tentativa em %lu s.\n", (unsigned long)(esperaMs / 1000));
+        esperaMs = aguardarProximaBusca(esperaMs);
       }
       continue;
     }
 
-    // --- 2. Conectado: espera comandos do botão ---
-    uint8_t cmd;
-    if (xQueueReceive(filaComando, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      if (!bleEnviar(cmd)) {
-        // Falhou: a conexão provavelmente caiu. Na reconexão o estado
-        // desejado é reenviado, então o comando não se perde.
-        bleConectado = false;
-      }
+    uint8_t comando;
+    if (xQueueReceive(filaDeComandos, &comando, pdMS_TO_TICKS(ESPERA_POR_COMANDO_MS)) == pdTRUE) {
+      // Se o envio falhar, a reconexão reenvia o estado desejado: o pedido não se perde.
+      if (!enviarComando(comando)) conectadoNaCamera = false;
     }
   }
 }
 
-// ==================== TELA (mostrador) ====================
+// ==================== MOSTRADOR ====================
 
-static const char *DIAS[] = {"dom", "seg", "ter", "qua", "qui", "sex", "sab"};
-static const char *MESES[] = {"jan", "fev", "mar", "abr", "mai", "jun",
-                              "jul", "ago", "set", "out", "nov", "dez"};
+static const char *DIAS_DA_SEMANA[] = {"dom", "seg", "ter", "qua", "qui", "sex", "sab"};
+static const char *MESES[] = {"jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"};
 
-// Dia da semana (0 = domingo), algoritmo de Sakamoto.
-int diaDaSemana(int a, int m, int d) {
-  static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-  if (m < 3) a -= 1;
-  return (a + a / 4 - a / 100 + a / 400 + t[m - 1] + d) % 7;
+// Algoritmo de Sakamoto (0 = domingo).
+int diaDaSemana(int ano, int mes, int dia) {
+  static const int deslocamentoDoMes[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (mes < 3) ano -= 1;
+  return (ano + ano / 4 - ano / 100 + ano / 400 + deslocamentoDoMes[mes - 1] + dia) % 7;
 }
 
-// Ícone de Bluetooth pequeno (o mesmo símbolo que smartwatches usam para
-// "pareado com o celular") — por isso não chama atenção.
-void desenharIconeBT(int x, int y, uint16_t cor) {
-  tft->drawLine(x, y - 7, x, y + 7, cor);
-  tft->drawLine(x, y - 7, x + 4, y - 3, cor);
-  tft->drawLine(x + 4, y - 3, x - 4, y + 4, cor);
-  tft->drawLine(x, y + 7, x + 4, y + 3, cor);
-  tft->drawLine(x + 4, y + 3, x - 4, y - 4, cor);
+// O mesmo símbolo de "pareado com o celular" dos smartwatches: não chama atenção.
+void desenharIconeBluetooth(int x, int y, uint16_t cor) {
+  tela->drawLine(x, y - 7, x, y + 7, cor);
+  tela->drawLine(x, y - 7, x + 4, y - 3, cor);
+  tela->drawLine(x + 4, y - 3, x - 4, y + 4, cor);
+  tela->drawLine(x, y + 7, x + 4, y + 3, cor);
+  tela->drawLine(x + 4, y + 3, x - 4, y - 4, cor);
 }
 
-void desenharMostrador(bool completo) {
-  static int ultimoMinuto = -1, ultimaBateria = -1;
+void desenharHoraEData(const RTC_Date &agora) {
+  char hora[6];
+  snprintf(hora, sizeof(hora), "%02d:%02d", agora.hour, agora.minute);
+  tela->setTextDatum(MC_DATUM);
+  tela->setTextColor(COR_HORA, COR_FUNDO);
+  tela->drawString(hora, CENTRO_X, POSICAO_HORA_Y, FONTE_HORA);
+
+  char data[24];
+  int indiceDoDia = diaDaSemana(agora.year, agora.month, agora.day);
+  snprintf(data, sizeof(data), "  %s, %02d %s  ", DIAS_DA_SEMANA[indiceDoDia], agora.day, MESES[(agora.month + 11) % 12]);
+  tela->setTextColor(COR_SECUNDARIA, COR_FUNDO);
+  tela->drawString(data, CENTRO_X, POSICAO_DATA_Y, FONTE_DATA);
+}
+
+void desenharBateria(int percentual) {
+  char texto[8];
+  snprintf(texto, sizeof(texto), " %d%% ", percentual);
+  tela->setTextDatum(TR_DATUM);
+  tela->setTextColor(COR_SECUNDARIA, COR_FUNDO);
+  tela->drawString(texto, 232, 8, FONTE_BATERIA);
+}
+
+void desenharIconeDeConexao(bool conectado) {
+  tela->fillRect(4, 2, 20, 20, COR_FUNDO);
+  if (conectado) desenharIconeBluetooth(14, 12, COR_ICONE);
+}
+
+// Só redesenha o que mudou, para a tela não piscar.
+void desenharMostrador(bool redesenharTudo) {
+  static int ultimoMinuto = -1;
+  static int ultimaBateria = -1;
   static bool ultimaConexao = false;
 
-  RTC_Date agora = ttgo->rtc->getDateTime();
-  int bateria = ttgo->power->getBattPercentage();
-  bool conectado = bleConectado;
+  RTC_Date agora = relogio->rtc->getDateTime();
+  int bateria = relogio->power->getBattPercentage();
+  bool conectado = conectadoNaCamera;
 
-  if (completo) {
-    tft->fillScreen(COR_FUNDO);
-    ultimoMinuto = ultimaBateria = -1;
+  if (redesenharTudo) {
+    tela->fillScreen(COR_FUNDO);
+    ultimoMinuto = -1;
+    ultimaBateria = -1;
     ultimaConexao = !conectado;
   }
-
-  // Hora e data (só redesenha quando o minuto muda)
   if (agora.minute != ultimoMinuto) {
     ultimoMinuto = agora.minute;
-    char hora[6];
-    snprintf(hora, sizeof(hora), "%02d:%02d", agora.hour, agora.minute);
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextColor(COR_HORA, COR_FUNDO);
-    tft->drawString(hora, 120, 105, 7);  // fonte 7: estilo display digital
-
-    char data[24];
-    int ds = diaDaSemana(agora.year, agora.month, agora.day);
-    snprintf(data, sizeof(data), "  %s, %02d %s  ", DIAS[ds], agora.day, MESES[(agora.month + 11) % 12]);
-    tft->setTextColor(COR_SECUNDARIA, COR_FUNDO);
-    tft->drawString(data, 120, 160, 4);
+    desenharHoraEData(agora);
   }
-
-  // Bateria (canto superior direito)
   if (bateria != ultimaBateria) {
     ultimaBateria = bateria;
-    char txt[8];
-    snprintf(txt, sizeof(txt), " %d%% ", bateria);
-    tft->setTextDatum(TR_DATUM);
-    tft->setTextColor(COR_SECUNDARIA, COR_FUNDO);
-    tft->drawString(txt, 232, 8, 2);
+    desenharBateria(bateria);
   }
-
-  // Ícone de conexão (canto superior esquerdo)
   if (conectado != ultimaConexao) {
     ultimaConexao = conectado;
-    tft->fillRect(4, 2, 20, 20, COR_FUNDO);
-    if (conectado) desenharIconeBT(14, 12, COR_ICONE);
+    desenharIconeDeConexao(conectado);
   }
 }
 
 void ligarTela() {
-  ttgo->displayWakeup();
-  ttgo->openBL();
+  relogio->displayWakeup();
+  relogio->openBL();
   telaLigada = true;
-  telaLigadaDesde = millis();
+  telaLigadaDesdeMs = millis();
   desenharMostrador(true);
 }
 
 void desligarTela() {
-  ttgo->closeBL();
-  ttgo->displaySleep();
+  relogio->closeBL();
+  relogio->displaySleep();
   telaLigada = false;
 }
 
-// ==================== TOQUE NA TELA ====================
-
-// Tocar acende a tela; tocar com ela acesa renova o tempo ligada.
-void tratarToque() {
-  static unsigned long ultimaLeitura = 0;
-  static bool tocando = false;
-  if (millis() - ultimaLeitura < TOQUE_INTERVALO_MS) return;
-  ultimaLeitura = millis();
+// Reage só quando o dedo encosta, para um toque longo não acender e apagar várias vezes.
+void tratarToqueNaTela() {
+  static unsigned long ultimaLeituraMs = 0;
+  static bool dedoNaTela = false;
+  if (millis() - ultimaLeituraMs < INTERVALO_LEITURA_TOQUE_MS) return;
+  ultimaLeituraMs = millis();
 
   int16_t x, y;
-  bool toqueAgora = ttgo->getTouch(x, y);
-
-  // Só reage no INÍCIO do toque (dedo encostou), não enquanto o dedo fica
-  // na tela, pra um toque só não acender e apagar várias vezes.
-  if (toqueAgora && !tocando) {
-    if (telaLigada) telaLigadaDesde = millis();
+  bool tocandoAgora = relogio->getTouch(x, y);
+  if (tocandoAgora && !dedoNaTela) {
+    if (telaLigada) telaLigadaDesdeMs = millis();
     else ligarTela();
   }
-  tocando = toqueAgora;
+  dedoNaTela = tocandoAgora;
 }
 
 // ==================== HORÁRIO ====================
 
-static int mesDoNome(const char *m) {
+static int mesPeloNome(const char *nome) {
   static const char *nomes = "JanFebMarAprMayJunJulAugSepOctNovDec";
   for (int i = 0; i < 12; i++) {
-    if (strncmp(m, nomes + i * 3, 3) == 0) return i + 1;
+    if (strncmp(nome, nomes + i * 3, 3) == 0) return i + 1;
   }
   return 1;
 }
 
-static bool bissexto(int a) { return (a % 4 == 0 && a % 100 != 0) || a % 400 == 0; }
-
-static int diasNoMes(int a, int m) {
-  static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  return (m == 2 && bissexto(a)) ? 29 : d[m - 1];
+static bool anoBissexto(int ano) {
+  return (ano % 4 == 0 && ano % 100 != 0) || ano % 400 == 0;
 }
 
-// Acerta o RTC com o horário da compilação, mas só na PRIMEIRA vez que
-// este firmware liga (depois o RTC continua contando sozinho; se o
-// acertasse a cada boot, o relógio "voltaria no tempo" ao ser religado).
-//
-// Não usamos ttgo->rtc->check() porque ele só corrige quando a DATA do
-// RTC é anterior à da compilação: uma hora errada no mesmo dia ficava
-// errada pra sempre.
-void acertarHorarioSeFirmwareNovo() {
-  const char *idFirmware = __DATE__ " " __TIME__;  // ex.: "Sep 23 2026 14:05:33"
+static int diasNoMes(int ano, int mes) {
+  static const int dias[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  return (mes == 2 && anoBissexto(ano)) ? 29 : dias[mes - 1];
+}
 
-  Preferences prefs;
-  prefs.begin("relogio", false);
-  String gravado = prefs.getString("firmware", "");
-  if (gravado == idFirmware) {
-    prefs.end();
-    return;  // mesmo firmware de antes: o RTC já está certo
+// Acerta o RTC com o horário da compilação (Brasília, UTC-3) só na primeira vez que
+// um firmware novo liga; depois o RTC conta sozinho, mesmo com o relógio desligado.
+// O rtc->check() da biblioteca não serve: não corrige hora errada no mesmo dia.
+void acertarHorarioSeFirmwareNovo() {
+  const char *idFirmware = __DATE__ " " __TIME__;
+
+  Preferences preferencias;
+  preferencias.begin("relogio", false);
+  if (preferencias.getString("firmware", "") == idFirmware) {
+    preferencias.end();
+    return;
   }
 
-  // __DATE__ = "Sep 23 2026" (dia com espaço à esquerda se < 10)
-  // __TIME__ = "14:05:33"    (horário local do computador que compilou)
+  // __DATE__ = "Sep 23 2026", __TIME__ = "14:05:33"
   const char *data = __DATE__;
-  const char *hora = __TIME__;
-  int mes = mesDoNome(data);
+  const char *horario = __TIME__;
+  int mes = mesPeloNome(data);
   int dia = atoi(data + 4);
   int ano = atoi(data + 7);
-  int h = atoi(hora), mi = atoi(hora + 3), se = atoi(hora + 6);
+  int hora = atoi(horario);
+  int minuto = atoi(horario + 3);
+  int segundo = atoi(horario + 6) + AJUSTE_TEMPO_DE_GRAVACAO_S;
 
-  // Soma o tempo de compilar + enviar, com "vai um" até o ano.
-  se += AJUSTE_GRAVACAO_S;
-  mi += se / 60; se %= 60;
-  h += mi / 60;  mi %= 60;
-  if (h >= 24) {
-    h -= 24;
+  minuto += segundo / 60;
+  segundo %= 60;
+  hora += minuto / 60;
+  minuto %= 60;
+  if (hora >= 24) {
+    hora -= 24;
     if (++dia > diasNoMes(ano, mes)) {
       dia = 1;
-      if (++mes > 12) { mes = 1; ano++; }
+      if (++mes > 12) {
+        mes = 1;
+        ano++;
+      }
     }
   }
 
-  ttgo->rtc->setDateTime(ano, mes, dia, h, mi, se);
-  prefs.putString("firmware", idFirmware);
-  prefs.end();
-  Serial.printf("[Relogio] Horario acertado: %02d/%02d/%04d %02d:%02d:%02d\n",
-                dia, mes, ano, h, mi, se);
+  relogio->rtc->setDateTime(ano, mes, dia, hora, minuto, segundo);
+  preferencias.putString("firmware", idFirmware);
+  preferencias.end();
+  Serial.printf("[Relogio] Horario acertado: %02d/%02d/%04d %02d:%02d:%02d\n", dia, mes, ano, hora, minuto, segundo);
 }
 
 // ==================== BOTÃO ====================
 
+// Sem retorno visual, tátil ou sonoro (RE01); o Serial é só para testes.
 void alternarGravacao() {
   gravacaoDesejada = !gravacaoDesejada;
-  uint8_t cmd = gravacaoDesejada ? CMD_INICIAR : CMD_PARAR;
-  // Sobrescreve qualquer comando ainda não enviado: vale o último pedido.
-  xQueueOverwrite(filaComando, &cmd);
-  // Sem nenhum retorno visual/tátil/sonoro (RE01). Só no Serial, pra testes.
+  uint8_t comando = gravacaoDesejada ? COMANDO_INICIAR : COMANDO_PARAR;
+  xQueueOverwrite(filaDeComandos, &comando);
   Serial.println(gravacaoDesejada ? "[Safe Evidence] Gravacao pedida" : "[Safe Evidence] Encerramento pedido");
 }
 
-void tratarToqueCurto(unsigned long agora) {
-  if (agora - momentoUltimoToqueCurto <= DUPLO_TOQUE_JANELA_MS) {
-    Serial.println("[Safe Evidence] Clique duplo - desligando...");
-    Serial.flush();
-    // Se estava gravando, pede pra câmera parar antes de desligar.
-    if (gravacaoDesejada) {
-      alternarGravacao();
-      delay(1500);  // dá tempo da tarefa de BLE enviar
-    }
-    ttgo->power->shutdown();
+void desligarRelogio() {
+  Serial.println("[Safe Evidence] Clique duplo - desligando...");
+  Serial.flush();
+  if (gravacaoDesejada) {
+    alternarGravacao();
+    delay(ESPERA_ENVIO_ANTES_DE_DESLIGAR_MS);
+  }
+  relogio->power->shutdown();
+}
+
+void tratarToqueCurto(unsigned long agoraMs) {
+  if (agoraMs - ultimoToqueCurtoMs <= JANELA_DUPLO_TOQUE_MS) {
+    desligarRelogio();
     return;
   }
-  momentoUltimoToqueCurto = agora;
-
+  ultimoToqueCurtoMs = agoraMs;
   if (telaLigada) desligarTela();
   else ligarTela();
 }
 
+// O pino INT fica baixo enquanto houver qualquer interrupção pendente no AXP202
+// (botão, carregador, USB); conferir o nível evita que uma delas trave o botão.
 void tratarBotao() {
-  // O pino INT fica em nível BAIXO enquanto houver QUALQUER interrupção
-  // pendente no AXP202 (botão, carregador, USB...). Checar o nível, e não
-  // só a flag da ISR, evita que uma interrupção esquecida "trave" o botão.
-  if (!pmuInterrompeu && digitalRead(AXP202_INT) == HIGH) return;
-  pmuInterrompeu = false;
+  if (!chipDeEnergiaInterrompeu && digitalRead(AXP202_INT) == HIGH) return;
+  chipDeEnergiaInterrompeu = false;
 
-  ttgo->power->readIRQ();
-  if (ttgo->power->isPEKLongPressIRQ()) {
+  relogio->power->readIRQ();
+  if (relogio->power->isPEKLongPressIRQ()) {
     alternarGravacao();
-  } else if (ttgo->power->isPEKShortPressIRQ()) {
+  } else if (relogio->power->isPEKShortPressIRQ()) {
     tratarToqueCurto(millis());
   }
-  // Limpa SEMPRE (inclusive interrupções que não são do botão).
-  ttgo->power->clearIRQ();
+  relogio->power->clearIRQ();
 }
 
 // ==================== SETUP / LOOP ====================
 
+void configurarChipDeEnergia() {
+  relogio->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1 | AXP202_VBUS_VOL_ADC1 | AXP202_VBUS_CUR_ADC1,
+                             true);
+  relogio->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ | AXP202_PEK_LONGPRESS_IRQ, true);
+  relogio->power->clearIRQ();
+  pinMode(AXP202_INT, INPUT);
+  attachInterrupt(AXP202_INT, aoInterromperChipDeEnergia, FALLING);
+}
+
 void setup() {
   Serial.begin(115200);
+  relogio = TTGOClass::getWatch();
+  relogio->begin();
+  tela = relogio->tft;
 
-  ttgo = TTGOClass::getWatch();
-  ttgo->begin();
-  tft = ttgo->tft;
-
-  // Horário de Brasília: acerta o RTC na primeira vez que este firmware liga.
   acertarHorarioSeFirmwareNovo();
-
-  // Leitura da bateria
-  ttgo->power->adc1Enable(AXP202_BATT_VOL_ADC1 | AXP202_BATT_CUR_ADC1 |
-                          AXP202_VBUS_VOL_ADC1 | AXP202_VBUS_CUR_ADC1, true);
-
-  // Botão (toque curto e longo) via interrupção do AXP202
-  ttgo->power->enableIRQ(AXP202_PEK_SHORTPRESS_IRQ | AXP202_PEK_LONGPRESS_IRQ, true);
-  ttgo->power->clearIRQ();
-  pinMode(AXP202_INT, INPUT);
-  attachInterrupt(AXP202_INT, aoInterromperPMU, FALLING);
-
+  configurarChipDeEnergia();
   ligarTela();
 
-  // BLE: nome vazio (o relógio não anuncia nada, só procura a câmera)
+  // Nome vazio: o relógio não anuncia nada, só procura a câmera.
   NimBLEDevice::init("");
-  filaComando = xQueueCreate(1, sizeof(uint8_t));
-  xTaskCreatePinnedToCore(tarefaBLE, "ble", 8192, nullptr, 1, nullptr, 0);
+  filaDeComandos = xQueueCreate(1, sizeof(uint8_t));
+  xTaskCreatePinnedToCore(tarefaBle, "ble", PILHA_TAREFA_BLE, nullptr, 1, nullptr, NUCLEO_TAREFA_BLE);
 
   Serial.println("[Safe Evidence] Pronto.");
 }
 
 void loop() {
   tratarBotao();
-  tratarToque();
+  tratarToqueNaTela();
 
   if (telaLigada) {
-    if (millis() - telaLigadaDesde > TELA_TEMPO_LIGADA_MS) {
+    static unsigned long ultimoDesenhoMs = 0;
+    if (millis() - telaLigadaDesdeMs > TEMPO_TELA_LIGADA_MS) {
       desligarTela();
-    } else {
-      static unsigned long ultimoDesenho = 0;
-      if (millis() - ultimoDesenho > 500) {
-        ultimoDesenho = millis();
-        desenharMostrador(false);
-      }
+    } else if (millis() - ultimoDesenhoMs > INTERVALO_REDESENHO_MS) {
+      ultimoDesenhoMs = millis();
+      desenharMostrador(false);
     }
   }
 
-  delay(20);
+  delay(PAUSA_DO_LACO_MS);
 }
-
-/*
-  ---------------------------------------------------------------------------
-  NOTA: nimconfig.h (relógio x câmera)
-  ---------------------------------------------------------------------------
-  A NimBLE-Arduino guarda quais "papéis" BLE ficam habilitados num único
-  arquivo, nimconfig.h, na pasta da biblioteca instalada:
-
-    Documentos\Arduino\libraries\NimBLE-Arduino\src\nimconfig.h
-
-  A ESP32-CAM pede CENTRAL e OBSERVER DESABILITADOS (economia de IRAM).
-  O relógio PRECISA dos dois habilitados (é ele quem procura e conecta).
-  A Arduino IDE não aceita uma cópia da biblioteca dentro da pasta do
-  sketch, então:
-    - antes de compilar o RELÓGIO: linhas de CENTRAL/OBSERVER desabilitados
-      COMENTADAS (padrão da biblioteca);
-    - antes de compilar a CÂMERA: descomente essas linhas.
-  ---------------------------------------------------------------------------
-*/
